@@ -500,10 +500,10 @@ func (p *Provider) Handler() http.Handler {
 		// NOTE: by default Dex will use the /logout route to only logout sessions, doesn't invalidate jwt tokens,
 		// to avoid confusion on users, we're not allowing for this, and only enable OIDC logout triggered through
 		// the dashboard which will invalidate both the session and the jwt token
-		if strings.HasSuffix(r.URL.Path, "/logout") && r.FormValue("id_token_hint") == "" {
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
+		//if strings.HasSuffix(r.URL.Path, "/logout") && r.FormValue("id_token_hint") == "" {
+		//http.Redirect(w, r, "/", http.StatusSeeOther)
+		//return
+		//}
 
 		p.dexServer.ServeHTTP(w, r)
 	})

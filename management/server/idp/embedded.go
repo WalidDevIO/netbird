@@ -216,7 +216,7 @@ func configureMFA(cfg *dex.YAMLConfig) error {
 		// Has to be caps otherwise it will fail
 		Type:           "TOTP",
 		Config:         rawTotpConfig,
-		ConnectorTypes: []string{},
+		ConnectorTypes: []string{"local"},
 	}}
 
 	rememberMeEnabled := false
