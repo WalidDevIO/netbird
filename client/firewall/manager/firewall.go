@@ -185,6 +185,30 @@ type Manager interface {
 	SetupEBPFProxyNoTrack(proxyPort, wgPort uint16) error
 }
 
+// CIDRFilteringManager is implemented by firewall backends that can match an
+// inbound peer rule on a source prefix instead of a single overlay address.
+// It backs policies whose source is a network resource: the traffic reaching
+// the peer comes from an agentless host on that network, forwarded by a routing
+// peer, so its source address is never one of the overlay peer addresses the
+// regular peer rules and ipsets are built from.
+//
+// Rules it returns are removed through Manager.DeletePeerRule like any other
+// peer rule.
+type CIDRFilteringManager interface {
+	// AddPeerCIDRFiltering adds a rule matching any source address within prefix.
+	//
+	// Note: Callers should call Flush() after adding rules to ensure
+	// they are applied to the kernel and rule handles are refreshed.
+	AddPeerCIDRFiltering(
+		id []byte,
+		prefix netip.Prefix,
+		proto Protocol,
+		sPort *Port,
+		dPort *Port,
+		action Action,
+	) ([]Rule, error)
+}
+
 func GenKey(format string, pair RouterPair) string {
 	return fmt.Sprintf(format, pair.ID, pair.Inverse)
 }

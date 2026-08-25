@@ -228,6 +228,33 @@ func isIPv6RouteRule(sources []netip.Prefix, destination firewall.Network) bool 
 	return len(sources) > 0 && sources[0].Addr().Is6()
 }
 
+// AddPeerCIDRFiltering adds a peer rule matching a whole source network,
+// dispatching to the ACL manager of the prefix's address family.
+func (m *Manager) AddPeerCIDRFiltering(
+	id []byte,
+	prefix netip.Prefix,
+	proto firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+) ([]firewall.Rule, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("add peer CIDR filtering: invalid prefix %s", prefix)
+	}
+
+	if prefix.Addr().Unmap().Is4() {
+		return m.aclMgr.AddPeerCIDRFiltering(id, prefix, proto, sPort, dPort, action)
+	}
+
+	if !m.hasIPv6() {
+		return nil, fmt.Errorf("add peer CIDR filtering for %s: %w", prefix, firewall.ErrIPv6NotInitialized)
+	}
+	return m.aclMgr6.AddPeerCIDRFiltering(id, prefix, proto, sPort, dPort, action)
+}
+
 // DeletePeerRule from the firewall by rule definition
 func (m *Manager) DeletePeerRule(rule firewall.Rule) error {
 	m.mutex.Lock()

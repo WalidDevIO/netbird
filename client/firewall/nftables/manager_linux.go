@@ -277,6 +277,33 @@ func (m *Manager) AddPeerFiltering(
 	return m.aclManager6.AddPeerFiltering(id, ip, proto, sPort, dPort, action, ipsetName)
 }
 
+// AddPeerCIDRFiltering adds a peer rule matching a whole source network,
+// dispatching to the ACL manager of the prefix's address family.
+func (m *Manager) AddPeerCIDRFiltering(
+	id []byte,
+	prefix netip.Prefix,
+	proto firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+) ([]firewall.Rule, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("add peer CIDR filtering: invalid prefix %s", prefix)
+	}
+
+	if prefix.Addr().Unmap().Is4() {
+		return m.aclManager.AddPeerCIDRFiltering(id, prefix, proto, sPort, dPort, action)
+	}
+
+	if !m.hasIPv6() {
+		return nil, fmt.Errorf("add peer CIDR filtering for %s: %w", prefix, firewall.ErrIPv6NotInitialized)
+	}
+	return m.aclManager6.AddPeerCIDRFiltering(id, prefix, proto, sPort, dPort, action)
+}
+
 func (m *Manager) AddRouteFiltering(
 	id []byte,
 	sources []netip.Prefix,

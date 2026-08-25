@@ -24,6 +24,10 @@ import (
 
 var ErrSourceRangesEmpty = errors.New("sources range is empty")
 
+// ErrCIDRFilteringUnsupported is returned when management sends a prefix-sourced
+// peer rule to a backend that can only match single addresses.
+var ErrCIDRFilteringUnsupported = errors.New("firewall backend does not support prefix-sourced peer rules")
+
 // Manager is a ACL rules manager
 type Manager interface {
 	ApplyFiltering(networkMap *mgmProto.NetworkMap, dnsRouteFeatureFlag bool)
@@ -279,7 +283,7 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 	r *mgmProto.FirewallRule,
 	ipsetName string,
 ) (id.RuleID, []firewall.Rule, error) {
-	ip, err := extractRuleIP(r)
+	prefix, err := extractRuleSource(r)
 	if err != nil {
 		return "", nil, err
 	}
@@ -308,6 +312,11 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 		}
 	}
 
+	if !singleAddrRule(prefix) {
+		return d.cidrRuleToFirewallRule(r, prefix, protocol, port, action)
+	}
+
+	ip := prefix.Addr()
 	ruleID := d.getPeerRuleID(ip, protocol, int(r.Direction), port, action)
 	if rulesPair, ok := d.peerRulesPairs[ruleID]; ok {
 		return ruleID, rulesPair, nil
@@ -332,6 +341,59 @@ func (d *DefaultManager) protoRuleToFirewallRule(
 	}
 
 	return ruleID, rules, nil
+}
+
+// cidrRuleToFirewallRule installs a peer rule whose source is a whole prefix.
+// The traffic it admits comes from hosts that have no NetBird agent, so the
+// backend has to match on the network rather than on a known peer address.
+func (d *DefaultManager) cidrRuleToFirewallRule(
+	r *mgmProto.FirewallRule,
+	prefix netip.Prefix,
+	protocol firewall.Protocol,
+	port *firewall.Port,
+	action firewall.Action,
+) (id.RuleID, []firewall.Rule, error) {
+	cidrFirewall, ok := d.firewall.(firewall.CIDRFilteringManager)
+	if !ok {
+		return "", nil, fmt.Errorf("%w: source %s", ErrCIDRFilteringUnsupported, prefix)
+	}
+
+	ruleID := d.getPeerCIDRRuleID(prefix, protocol, int(r.Direction), port, action)
+	if rulesPair, ok := d.peerRulesPairs[ruleID]; ok {
+		return ruleID, rulesPair, nil
+	}
+
+	var sPort, dPort *firewall.Port
+	switch r.Direction {
+	case mgmProto.RuleDirection_IN:
+		dPort = port
+	case mgmProto.RuleDirection_OUT:
+		if d.firewall.IsStateful() {
+			return "", nil, nil
+		}
+		// return traffic for outbound connections if firewall is stateless
+		if shouldSkipInvertedRule(protocol, port) {
+			return "", nil, nil
+		}
+		sPort = port
+	default:
+		return "", nil, fmt.Errorf("invalid direction, skipping firewall rule")
+	}
+
+	rules, err := cidrFirewall.AddPeerCIDRFiltering(r.PolicyID, prefix, protocol, sPort, dPort, action)
+	if err != nil {
+		return "", nil, fmt.Errorf("add prefix firewall rule: %w", err)
+	}
+
+	return ruleID, rules, nil
+}
+
+// singleAddrRule reports whether the rule's source can go through the
+// address-based firewall path: either a host prefix, which is the shape of every
+// peer-sourced rule, or the unspecified wildcard both management and the
+// backends already read as "any source".
+func singleAddrRule(prefix netip.Prefix) bool {
+	return prefix.Bits() == prefix.Addr().BitLen() || prefix.Addr().IsUnspecified()
 }
 
 func portInfoEmpty(portInfo *mgmProto.PortInfo) bool {
@@ -402,29 +464,48 @@ func (d *DefaultManager) getPeerRuleID(
 	return id.RuleID(hex.EncodeToString(md5.New().Sum([]byte(idStr))))
 }
 
+// getPeerCIDRRuleID returns unique ID for a prefix-sourced rule. The prefix is
+// part of the key so a /32 rule and a covering /24 rule never collide.
+func (d *DefaultManager) getPeerCIDRRuleID(
+	prefix netip.Prefix,
+	proto firewall.Protocol,
+	direction int,
+	port *firewall.Port,
+	action firewall.Action,
+) id.RuleID {
+	idStr := prefix.String() + string(proto) + strconv.Itoa(direction) + strconv.Itoa(int(action))
+	if port != nil {
+		idStr += port.String()
+	}
+
+	return id.RuleID(hex.EncodeToString(md5.New().Sum([]byte(idStr))))
+}
+
 // getRuleGroupingSelector takes all rule properties except IP address to build selector
 func (d *DefaultManager) getRuleGroupingSelector(rule *mgmProto.FirewallRule) string {
 	return fmt.Sprintf("%v:%v:%v:%s:%v", strconv.Itoa(int(rule.Direction)), rule.Action, rule.Protocol, rule.Port, rule.PortInfo)
 }
 
-// extractRuleIP extracts the peer IP from a firewall rule.
-// If sourcePrefixes is populated (new management), decode the first entry and use its address.
-// Otherwise fall back to the deprecated PeerIP string field (old management).
-func extractRuleIP(r *mgmProto.FirewallRule) (netip.Addr, error) {
+// extractRuleSource extracts the traffic source of a firewall rule as a prefix.
+// If sourcePrefixes is populated (new management), decode the first entry.
+// Otherwise fall back to the deprecated PeerIP string field (old management),
+// which can only carry a single address and so yields a host prefix.
+func extractRuleSource(r *mgmProto.FirewallRule) (netip.Prefix, error) {
 	if len(r.SourcePrefixes) > 0 {
-		addr, err := netiputil.DecodeAddr(r.SourcePrefixes[0])
+		prefix, err := netiputil.DecodePrefix(r.SourcePrefixes[0])
 		if err != nil {
-			return netip.Addr{}, fmt.Errorf("decode source prefix: %w", err)
+			return netip.Prefix{}, fmt.Errorf("decode source prefix: %w", err)
 		}
-		return addr.Unmap(), nil
+		return netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()), nil
 	}
 
 	//nolint:staticcheck // PeerIP used for backward compatibility with old management
 	addr, err := netip.ParseAddr(r.PeerIP)
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("invalid IP address, skipping firewall rule")
+		return netip.Prefix{}, fmt.Errorf("invalid IP address, skipping firewall rule")
 	}
-	return addr.Unmap(), nil
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 func convertToFirewallProtocol(protocol mgmProto.RuleProtocol) (firewall.Protocol, error) {

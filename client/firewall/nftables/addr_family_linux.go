@@ -55,6 +55,11 @@ type addrFamily struct {
 	icmpProto uint8
 }
 
+// prefixMask returns the network mask for bits, sized for this address family.
+func (af addrFamily) prefixMask(bits int) []byte {
+	return net.CIDRMask(bits, af.totalBits)
+}
+
 // familyForAddr returns the address family for the given IP.
 func familyForAddr(is4 bool) addrFamily {
 	if is4 {

@@ -95,11 +95,18 @@ type Manager struct {
 	outgoingRules     map[netip.Addr]RuleSet
 	incomingDenyRules map[netip.Addr]RuleSet
 	incomingRules     map[netip.Addr]RuleSet
-	routeRules        RouteRules
-	routeRulesMap     map[nbid.RuleID]*RouteRule
-	decoders          sync.Pool
-	wgIface           common.IFaceMapper
-	nativeFirewall    firewall.Manager
+
+	// Prefix-sourced peer rules cannot be keyed by source address, so they are
+	// kept in insertion order and scanned linearly. Deny rules stay in their own
+	// slice so they keep winning over accept rules, same as the address maps.
+	incomingDenyCIDRRules []PeerRule
+	incomingCIDRRules     []PeerRule
+
+	routeRules     RouteRules
+	routeRulesMap  map[nbid.RuleID]*RouteRule
+	decoders       sync.Pool
+	wgIface        common.IFaceMapper
+	nativeFirewall firewall.Manager
 
 	mutex sync.RWMutex
 
@@ -584,6 +591,50 @@ func (m *Manager) AddPeerFiltering(
 	return []firewall.Rule{&r}, nil
 }
 
+// AddPeerCIDRFiltering adds a peer rule matching every source address inside
+// prefix. Traffic from agentless hosts on a routed network arrives with such an
+// address, which no peer-keyed rule can match.
+func (m *Manager) AddPeerCIDRFiltering(
+	id []byte,
+	prefix netip.Prefix,
+	proto firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+) ([]firewall.Rule, error) {
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("invalid prefix: %s", prefix)
+	}
+
+	prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()).Masked()
+
+	r := PeerRule{
+		id:        uuid.New().String(),
+		mgmtId:    id,
+		ip:        prefix.Addr(),
+		prefix:    prefix,
+		ipLayer:   layers.LayerTypeIPv6,
+		matchByIP: true,
+		sPort:     sPort,
+		dPort:     dPort,
+		drop:      action == firewall.ActionDrop,
+	}
+	if prefix.Addr().Is4() {
+		r.ipLayer = layers.LayerTypeIPv4
+	}
+	r.protoLayer = protoToLayer(proto, r.ipLayer)
+
+	m.mutex.Lock()
+	if r.drop {
+		m.incomingDenyCIDRRules = append(m.incomingDenyCIDRRules, r)
+	} else {
+		m.incomingCIDRRules = append(m.incomingCIDRRules, r)
+	}
+	m.mutex.Unlock()
+
+	return []firewall.Rule{&r}, nil
+}
+
 func (m *Manager) AddRouteFiltering(
 	id []byte,
 	sources []netip.Prefix,
@@ -677,6 +728,10 @@ func (m *Manager) DeletePeerRule(rule firewall.Rule) error {
 		return fmt.Errorf("delete rule: invalid rule type: %T", rule)
 	}
 
+	if r.matchesPrefix() {
+		return m.deletePeerCIDRRule(r)
+	}
+
 	var sourceMap map[netip.Addr]RuleSet
 	if r.drop {
 		sourceMap = m.incomingDenyRules
@@ -699,6 +754,25 @@ func (m *Manager) DeletePeerRule(rule firewall.Rule) error {
 	return nil
 }
 
+// deletePeerCIDRRule removes a prefix-sourced rule. Must be called with
+// m.mutex held.
+func (m *Manager) deletePeerCIDRRule(r *PeerRule) error {
+	rules := &m.incomingCIDRRules
+	if r.drop {
+		rules = &m.incomingDenyCIDRRules
+	}
+
+	idx := slices.IndexFunc(*rules, func(candidate PeerRule) bool {
+		return candidate.id == r.id
+	})
+	if idx < 0 {
+		return fmt.Errorf("delete rule: no rule with such id: %v", r.id)
+	}
+
+	*rules = slices.Delete(*rules, idx, idx+1)
+	return nil
+}
+
 // SetLegacyManagement doesn't need to be implemented for this manager
 func (m *Manager) SetLegacyManagement(isLegacy bool) error {
 	if m.nativeFirewall == nil {
@@ -716,6 +790,8 @@ func (m *Manager) resetState() {
 	clear(m.outgoingRules)
 	clear(m.incomingDenyRules)
 	clear(m.incomingRules)
+	m.incomingDenyCIDRRules = nil
+	m.incomingCIDRRules = nil
 	clear(m.routeRulesMap)
 	m.routeRules = m.routeRules[:0]
 	m.udpHookOut.Store(nil)
@@ -1625,6 +1701,9 @@ func (m *Manager) peerACLsBlock(srcIP netip.Addr, d *decoder, packetData []byte)
 	if mgmtId, filter, ok := validateRule(srcIP, packetData, m.incomingDenyRules[srcIP], d); ok {
 		return mgmtId, filter
 	}
+	if mgmtId, filter, ok := validateCIDRRules(srcIP, m.incomingDenyCIDRRules, d); ok {
+		return mgmtId, filter
+	}
 
 	if mgmtId, filter, ok := validateRule(srcIP, packetData, m.incomingRules[srcIP], d); ok {
 		return mgmtId, filter
@@ -1635,8 +1714,27 @@ func (m *Manager) peerACLsBlock(srcIP netip.Addr, d *decoder, packetData []byte)
 	if mgmtId, filter, ok := validateRule(srcIP, packetData, m.incomingRules[netip.IPv6Unspecified()], d); ok {
 		return mgmtId, filter
 	}
+	if mgmtId, filter, ok := validateCIDRRules(srcIP, m.incomingCIDRRules, d); ok {
+		return mgmtId, filter
+	}
 
 	return nil, true
+}
+
+// validateCIDRRules returns the first prefix-sourced rule whose network contains
+// srcIP and whose protocol and ports match the packet.
+func validateCIDRRules(ip netip.Addr, rules []PeerRule, d *decoder) ([]byte, bool, bool) {
+	for i := range rules {
+		rule := &rules[i]
+		if !rule.prefix.Contains(ip) {
+			continue
+		}
+		if mgmtId, drop, ok := matchRulePayload(rule, d); ok {
+			return mgmtId, drop, true
+		}
+	}
+
+	return nil, false, false
 }
 
 func portsMatch(rulePort *firewall.Port, packetPort uint16) bool {
@@ -1657,33 +1755,43 @@ func portsMatch(rulePort *firewall.Port, packetPort uint16) bool {
 }
 
 func validateRule(ip netip.Addr, packetData []byte, rules map[string]PeerRule, d *decoder) ([]byte, bool, bool) {
-	payloadLayer := d.decoded[1]
-
 	for _, rule := range rules {
 		if rule.matchByIP && ip.Compare(rule.ip) != 0 {
 			continue
 		}
 
-		if rule.protoLayer == layerTypeAll {
+		if mgmtId, drop, ok := matchRulePayload(&rule, d); ok {
+			return mgmtId, drop, true
+		}
+	}
+
+	return nil, false, false
+}
+
+// matchRulePayload checks a rule's protocol and ports against the decoded
+// packet. The source address is matched by the caller, which knows whether it
+// compares a single address or a network.
+func matchRulePayload(rule *PeerRule, d *decoder) ([]byte, bool, bool) {
+	if rule.protoLayer == layerTypeAll {
+		return rule.mgmtId, rule.drop, true
+	}
+
+	payloadLayer := d.decoded[1]
+	if !protoLayerMatches(rule.protoLayer, payloadLayer) {
+		return nil, false, false
+	}
+
+	switch payloadLayer {
+	case layers.LayerTypeTCP:
+		if portsMatch(rule.sPort, uint16(d.tcp.SrcPort)) && portsMatch(rule.dPort, uint16(d.tcp.DstPort)) {
 			return rule.mgmtId, rule.drop, true
 		}
-
-		if !protoLayerMatches(rule.protoLayer, payloadLayer) {
-			continue
-		}
-
-		switch payloadLayer {
-		case layers.LayerTypeTCP:
-			if portsMatch(rule.sPort, uint16(d.tcp.SrcPort)) && portsMatch(rule.dPort, uint16(d.tcp.DstPort)) {
-				return rule.mgmtId, rule.drop, true
-			}
-		case layers.LayerTypeUDP:
-			if portsMatch(rule.sPort, uint16(d.udp.SrcPort)) && portsMatch(rule.dPort, uint16(d.udp.DstPort)) {
-				return rule.mgmtId, rule.drop, true
-			}
-		case layers.LayerTypeICMPv4, layers.LayerTypeICMPv6:
+	case layers.LayerTypeUDP:
+		if portsMatch(rule.sPort, uint16(d.udp.SrcPort)) && portsMatch(rule.dPort, uint16(d.udp.DstPort)) {
 			return rule.mgmtId, rule.drop, true
 		}
+	case layers.LayerTypeICMPv4, layers.LayerTypeICMPv6:
+		return rule.mgmtId, rule.drop, true
 	}
 
 	return nil, false, false

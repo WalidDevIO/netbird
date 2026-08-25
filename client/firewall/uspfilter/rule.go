@@ -18,7 +18,18 @@ type PeerRule struct {
 	protoLayer gopacket.LayerType
 	sPort      *firewall.Port
 	dPort      *firewall.Port
-	drop bool
+	drop       bool
+
+	// prefix is set instead of ip when the rule matches a whole source network
+	// rather than a single peer address. Rules carrying it live in the CIDR
+	// slices, which are scanned linearly because a map keyed by address cannot
+	// answer "which prefix contains this source".
+	prefix netip.Prefix
+}
+
+// matchesPrefix reports whether the rule matches on a source network.
+func (r *PeerRule) matchesPrefix() bool {
+	return r.prefix.IsValid()
 }
 
 // ID returns the rule id

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -99,13 +100,37 @@ func (m *AclManager) AddPeerFiltering(
 	}
 
 	newRules := make([]firewall.Rule, 0, 2)
-	ioRule, err := m.addIOFiltering(ip, proto, sPort, dPort, action, ipset)
+	ioRule, err := m.addIOFiltering(ip, netip.Prefix{}, proto, sPort, dPort, action, ipset)
 	if err != nil {
 		return nil, err
 	}
 
 	newRules = append(newRules, ioRule)
 	return newRules, nil
+}
+
+// AddPeerCIDRFiltering adds a rule matching every source address inside prefix.
+// Such a rule cannot use an ipset: NetBird's ACL sets hold plain addresses, and
+// widening them to interval sets would change how every peer rule is matched.
+func (m *AclManager) AddPeerCIDRFiltering(
+	id []byte,
+	prefix netip.Prefix,
+	proto firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+) ([]firewall.Rule, error) {
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("invalid prefix: %s", prefix)
+	}
+
+	prefix = prefix.Masked()
+	rule, err := m.addIOFiltering(net.IP(prefix.Addr().AsSlice()), prefix, proto, sPort, dPort, action, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return []firewall.Rule{rule}, nil
 }
 
 // DeletePeerRule from the firewall by rule definition
@@ -227,15 +252,19 @@ func (m *AclManager) Flush() error {
 	return nil
 }
 
+// addIOFiltering builds the input-chain rule. A valid prefix matches a whole
+// source network and takes precedence over the ipset path; a zero prefix keeps
+// the single-address behaviour.
 func (m *AclManager) addIOFiltering(
 	ip net.IP,
+	prefix netip.Prefix,
 	proto firewall.Protocol,
 	sPort *firewall.Port,
 	dPort *firewall.Port,
 	action firewall.Action,
 	ipset *nftables.Set,
 ) (*Rule, error) {
-	ruleId := generatePeerRuleId(ip, proto, sPort, dPort, action, ipset)
+	ruleId := generatePeerRuleId(ip, prefix, proto, sPort, dPort, action, ipset)
 	if r, ok := m.rules[ruleId]; ok {
 		return &Rule{
 			nftRule:    r.nftRule,
@@ -270,8 +299,13 @@ func (m *AclManager) addIOFiltering(
 
 	rawIP := ipToBytes(ip, m.af)
 	// check if rawIP contains zeroed IPv4 0.0.0.0 value
-	// in that case not add IP match expression into the rule definition
-	if slices.ContainsFunc(rawIP, func(v byte) bool { return v != 0 }) {
+	// in that case not add IP match expression into the rule definition.
+	// A prefix with a network address of all zeros (10.0.0.0/8 is not one, but
+	// 0.0.0.0/8 is) still has to be matched, or the rule would silently widen
+	// to every source.
+	matchSource := slices.ContainsFunc(rawIP, func(v byte) bool { return v != 0 }) ||
+		(prefix.IsValid() && prefix.Bits() > 0)
+	if matchSource {
 		expressions = append(expressions,
 			&expr.Payload{
 				DestRegister: 1,
@@ -280,8 +314,24 @@ func (m *AclManager) addIOFiltering(
 				Len:          m.af.addrLen,
 			},
 		)
-		// add individual IP for match if no ipset defined
-		if ipset == nil {
+		switch {
+		case prefix.IsValid():
+			expressions = append(expressions,
+				&expr.Bitwise{
+					SourceRegister: 1,
+					DestRegister:   1,
+					Len:            m.af.addrLen,
+					Mask:           m.af.prefixMask(prefix.Bits()),
+					Xor:            make([]byte, m.af.addrLen),
+				},
+				&expr.Cmp{
+					Op:       expr.CmpOpEq,
+					Register: 1,
+					Data:     rawIP,
+				},
+			)
+		case ipset == nil:
+			// add individual IP for match if no ipset defined
 			expressions = append(expressions,
 				&expr.Cmp{
 					Op:       expr.CmpOpEq,
@@ -289,7 +339,7 @@ func (m *AclManager) addIOFiltering(
 					Data:     rawIP,
 				},
 			)
-		} else {
+		default:
 			expressions = append(expressions,
 				&expr.Lookup{
 					SourceRegister: 1,
@@ -679,7 +729,7 @@ func (m *AclManager) refreshRuleHandles(chain *nftables.Chain, mangle bool) erro
 	return nil
 }
 
-func generatePeerRuleId(ip net.IP, proto firewall.Protocol, sPort *firewall.Port, dPort *firewall.Port, action firewall.Action, ipset *nftables.Set) string {
+func generatePeerRuleId(ip net.IP, prefix netip.Prefix, proto firewall.Protocol, sPort *firewall.Port, dPort *firewall.Port, action firewall.Action, ipset *nftables.Set) string {
 	rulesetID := ":" + string(proto) + ":"
 	if sPort != nil {
 		rulesetID += sPort.String()
@@ -690,6 +740,9 @@ func generatePeerRuleId(ip net.IP, proto firewall.Protocol, sPort *firewall.Port
 	}
 	rulesetID += ":"
 	rulesetID += strconv.Itoa(int(action))
+	if prefix.IsValid() {
+		return "cidr:" + prefix.String() + rulesetID
+	}
 	if ipset == nil {
 		return "ip:" + ip.String() + rulesetID
 	}
@@ -702,7 +755,6 @@ func ifname(n string) []byte {
 	return b
 }
 
-
 // ipToBytes converts net.IP to the correct byte length for the address family.
 func ipToBytes(ip net.IP, af addrFamily) []byte {
 	if af.addrLen == 4 {
@@ -710,4 +762,3 @@ func ipToBytes(ip net.IP, af addrFamily) []byte {
 	}
 	return ip.To16()
 }
-

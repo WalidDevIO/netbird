@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"slices"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -177,6 +178,72 @@ func (m *aclManager) AddPeerFiltering(
 		mangleSpecs: mangleSpecs,
 		ipsetName:   ipsetName,
 		ip:          ip.String(),
+		chain:       chain,
+		v6:          m.v6,
+	}
+
+	m.updateState()
+
+	return []firewall.Rule{rule}, nil
+}
+
+// AddPeerCIDRFiltering adds a rule matching every source address inside prefix.
+// It never uses an ipset: the ACL ipsets are hash:ip sets of peer addresses, and
+// a plain "-s <prefix>" match keeps the rule independent of them.
+func (m *aclManager) AddPeerCIDRFiltering(
+	id []byte,
+	prefix netip.Prefix,
+	protocol firewall.Protocol,
+	sPort *firewall.Port,
+	dPort *firewall.Port,
+	action firewall.Action,
+) ([]firewall.Rule, error) {
+	if !prefix.IsValid() {
+		return nil, fmt.Errorf("invalid prefix: %s", prefix)
+	}
+
+	prefix = prefix.Masked()
+	chain := chainNameInputRules
+
+	specs := cidrRuleSpecs(prefix, protoForFamily(protocol, m.v6), sPort, dPort)
+
+	mangleSpecs := slices.Clone(specs)
+	mangleSpecs = append(mangleSpecs,
+		"-i", m.wgIface.Name(),
+		"-m", "addrtype", "--dst-type", "LOCAL",
+		"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected),
+	)
+
+	specs = append(specs, "-j", actionToStr(action))
+
+	ok, err := m.iptablesClient.Exists(tableFilter, chain, specs...)
+	if err != nil {
+		return nil, fmt.Errorf("check rule: %w", err)
+	}
+	if ok {
+		return nil, fmt.Errorf("rule already exists")
+	}
+
+	// Insert DROP rules at the beginning, append ACCEPT rules at the end
+	if action == firewall.ActionDrop {
+		err = m.iptablesClient.Insert(tableFilter, chain, 1, specs...)
+	} else {
+		err = m.iptablesClient.Append(tableFilter, chain, specs...)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := m.iptablesClient.Append(tableMangle, chainRTPRE, mangleSpecs...); err != nil {
+		log.Errorf("failed to add mangle rule: %v", err)
+		mangleSpecs = nil
+	}
+
+	rule := &Rule{
+		ruleID:      uuid.New().String(),
+		specs:       specs,
+		mangleSpecs: mangleSpecs,
+		ip:          prefix.String(),
 		chain:       chain,
 		v6:          m.v6,
 	}
@@ -470,6 +537,17 @@ func filterRuleSpecs(ip net.IP, protocol string, sPort, dPort *firewall.Port, ac
 			specs = append(specs, "-s", ip.String())
 		}
 	}
+	if protocol != "all" {
+		specs = append(specs, "-p", protocol)
+	}
+	specs = append(specs, applyPort("--sport", sPort)...)
+	specs = append(specs, applyPort("--dport", dPort)...)
+	return specs
+}
+
+// cidrRuleSpecs returns the specs of a filtering rule matching a source network.
+func cidrRuleSpecs(prefix netip.Prefix, protocol string, sPort, dPort *firewall.Port) (specs []string) {
+	specs = append(specs, "-s", prefix.String())
 	if protocol != "all" {
 		specs = append(specs, "-p", protocol)
 	}
