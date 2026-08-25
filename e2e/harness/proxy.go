@@ -52,7 +52,7 @@ func StartProxy(ctx context.Context, c *Combined, proxyToken string, envOverride
 		return nil, err
 	}
 
-	workDir, err := os.MkdirTemp("/tmp", "nb-e2e-proxy-*")
+	workDir, err := os.MkdirTemp(hostTempRoot(), "nb-e2e-proxy-*")
 	if err != nil {
 		return nil, fmt.Errorf("create proxy work dir: %w", err)
 	}

@@ -8,8 +8,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// hostTempRoot is the directory the harness creates bind-mounted work dirs
+// under. Unix hosts use /tmp rather than os.TempDir(): Docker Desktop's default
+// file sharing excludes macOS's /var/folders TMPDIR, so a work dir there is a
+// path the daemon refuses to mount. Windows has no /tmp at all, and its temp
+// dir sits under the user profile, which Docker Desktop does share.
+func hostTempRoot() string {
+	if runtime.GOOS == "windows" {
+		return os.TempDir()
+	}
+	return "/tmp"
+}
 
 // modulePath is this module, used both to recognise the repo when walking up
 // from the working directory and to locate it when the suite lives elsewhere.

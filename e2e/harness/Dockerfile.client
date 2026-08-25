@@ -25,4 +25,12 @@ ENTRYPOINT [ "/usr/local/bin/netbird-entrypoint.sh" ]
 # where every file is 0444 — the cache drops the executable bit git records — and
 # a bare COPY then produces an entrypoint the runtime cannot exec.
 COPY --chmod=0755 client/netbird-entrypoint.sh /usr/local/bin/netbird-entrypoint.sh
+# A Windows checkout hands the script over with CRLF endings. The trailing
+# carriage return then becomes part of the shebang's interpreter name, so the
+# container exits 127 before the agent ever starts. \015 is the CR byte in
+# octal, which keeps this line free of literal control characters.
+RUN tr -d '\015' < /usr/local/bin/netbird-entrypoint.sh > /tmp/entrypoint \
+    && cat /tmp/entrypoint > /usr/local/bin/netbird-entrypoint.sh \
+    && rm /tmp/entrypoint \
+    && chmod 0755 /usr/local/bin/netbird-entrypoint.sh
 COPY --from=builder /out/netbird /usr/local/bin/netbird

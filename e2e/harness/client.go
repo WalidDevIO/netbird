@@ -35,7 +35,9 @@ type Client struct {
 
 // clientOptions is what the ClientOption values assemble.
 type clientOptions struct {
-	name string
+	name          string
+	extraNetworks []*testcontainers.DockerNetwork
+	ipForwarding  bool
 }
 
 // ClientOption adjusts how StartClient runs the agent.
@@ -50,6 +52,21 @@ type ClientOption func(*clientOptions)
 // is shared, and two containers cannot hold the same alias on one network.
 func WithClientName(name string) ClientOption {
 	return func(o *clientOptions) { o.name = name }
+}
+
+// WithExtraNetwork attaches the agent to an additional docker network, which is
+// how a routing peer gets a foot in the LAN it routes for. The agent keeps
+// reaching management over the combined server's network.
+func WithExtraNetwork(net *testcontainers.DockerNetwork) ClientOption {
+	return func(o *clientOptions) { o.extraNetworks = append(o.extraNetworks, net) }
+}
+
+// WithIPForwarding turns on kernel IPv4 forwarding for the agent's network
+// namespace when the container is created. A routing peer needs it, and the
+// agent cannot switch it on itself: /proc/sys is mounted read-only in an
+// unprivileged container, so a write from inside fails with EROFS.
+func WithIPForwarding() ClientOption {
+	return func(o *clientOptions) { o.ipForwarding = true }
 }
 
 // StartClient builds the client image and runs it on the combined server's
@@ -71,14 +88,21 @@ func StartClient(ctx context.Context, c *Combined, setupKey string, opts ...Clie
 		return nil, err
 	}
 
+	networks := []string{c.network.Name}
+	aliases := map[string][]string{c.network.Name: {o.name}}
+	for _, extra := range o.extraNetworks {
+		networks = append(networks, extra.Name)
+		aliases[extra.Name] = []string{o.name}
+	}
+
 	req := testcontainers.ContainerRequest{
 		Image: clientImage,
 		// The agent reports the container's hostname to management, so this is
 		// the name the peer is addressable by in the API as well as on the
 		// network. The entrypoint takes no hostname flag of its own.
 		Hostname:       o.name,
-		Networks:       []string{c.network.Name},
-		NetworkAliases: map[string][]string{c.network.Name: {o.name}},
+		Networks:       networks,
+		NetworkAliases: aliases,
 		Env: map[string]string{
 			"NB_MANAGEMENT_URL": combinedExposedURL,
 			"NB_SETUP_KEY":      setupKey,
@@ -89,6 +113,12 @@ func StartClient(ctx context.Context, c *Combined, setupKey string, opts ...Clie
 		},
 		HostConfigModifier: func(hc *container.HostConfig) {
 			hc.CapAdd = append(hc.CapAdd, "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE")
+			if o.ipForwarding {
+				if hc.Sysctls == nil {
+					hc.Sysctls = map[string]string{}
+				}
+				hc.Sysctls["net.ipv4.ip_forward"] = "1"
+			}
 		},
 	}
 
