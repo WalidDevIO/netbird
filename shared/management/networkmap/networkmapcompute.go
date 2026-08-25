@@ -111,30 +111,14 @@ func (nmd *NetworkMapData) GetPeerNetworkMapComponents(peerID string, peersCusto
 				continue
 			}
 			if addSourcePeers {
-				var peers []string
-				if policy.Rules[0].SourceResource.Type == string(types.ResourceTypePeer) && policy.Rules[0].SourceResource.ID != "" {
-					peers = []string{policy.Rules[0].SourceResource.ID}
-				} else {
-					peers = nmd.getUniquePeerIDsFromGroupsIDs(policy.SourceGroups())
-				}
+				peers := nmd.resourcePolicyPeerIDs(policy)
 				for _, pID := range nmd.getPostureValidPeersSaveFailed(peers, policy.SourcePostureChecks, &components.PostureFailedPeers) {
 					if _, exists := components.Peers[pID]; !exists {
 						components.Peers[pID] = nmd.Peers[pID]
 					}
 				}
 			} else {
-				peerInSources := false
-				if policy.Rules[0].SourceResource.Type == string(types.ResourceTypePeer) && policy.Rules[0].SourceResource.ID != "" {
-					peerInSources = policy.Rules[0].SourceResource.ID == peerID
-				} else {
-					for _, groupID := range policy.SourceGroups() {
-						if group := nmd.Groups[groupID]; group != nil && slices.Contains(group.Peers, peerID) {
-							peerInSources = true
-							break
-						}
-					}
-				}
-				if !peerInSources {
+				if !nmd.isResourcePolicyPeer(policy, peerID) {
 					continue
 				}
 				isValid, pname := nmd.validatePostureChecksOnPeerGetFailed(policy.SourcePostureChecks, peerID)
@@ -812,4 +796,47 @@ func filterGroupIDToUserIDs(fullMap map[string][]string, neededGroupIDs map[stri
 		}
 	}
 	return filtered
+}
+
+// resourcePolicyPeerIDs returns the peers a resource policy connects the
+// resource to. When the policy names the resource as its source the traffic
+// starts on the resource side, so the peers are the rule's destinations rather
+// than its sources.
+func (nmd *NetworkMapData) resourcePolicyPeerIDs(policy *nmdata.Policy) []string {
+	rule := policy.Rules[0]
+
+	if _, ok := types.NetworkResourceSourceID(rule); ok {
+		if rule.DestinationResource.Type == string(types.ResourceTypePeer) && rule.DestinationResource.ID != "" {
+			return []string{rule.DestinationResource.ID}
+		}
+		return nmd.getUniquePeerIDsFromGroupsIDs(rule.Destinations)
+	}
+
+	if rule.SourceResource.Type == string(types.ResourceTypePeer) && rule.SourceResource.ID != "" {
+		return []string{rule.SourceResource.ID}
+	}
+	return nmd.getUniquePeerIDsFromGroupsIDs(policy.SourceGroups())
+}
+
+// isResourcePolicyPeer reports whether peerID sits on the peer side of a
+// resource policy — the side opposite the resource, wherever the policy puts it.
+func (nmd *NetworkMapData) isResourcePolicyPeer(policy *nmdata.Policy, peerID string) bool {
+	rule := policy.Rules[0]
+
+	groups := policy.SourceGroups()
+	if _, ok := types.NetworkResourceSourceID(rule); ok {
+		if rule.DestinationResource.Type == string(types.ResourceTypePeer) && rule.DestinationResource.ID != "" {
+			return rule.DestinationResource.ID == peerID
+		}
+		groups = rule.Destinations
+	} else if rule.SourceResource.Type == string(types.ResourceTypePeer) && rule.SourceResource.ID != "" {
+		return rule.SourceResource.ID == peerID
+	}
+
+	for _, groupID := range groups {
+		if group := nmd.Groups[groupID]; group != nil && slices.Contains(group.Peers, peerID) {
+			return true
+		}
+	}
+	return false
 }

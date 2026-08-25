@@ -194,3 +194,30 @@ func authorizedGroupsEqual(a, b map[string][]string) bool {
 	}
 	return true
 }
+
+// NetworkResourceSourceID returns the ID of the network resource the rule uses
+// as its traffic source, and whether it has one. Peer-typed source resources are
+// not network resources and report false, as do domain resources: they carry no
+// static prefix, so no source-matching firewall rule can be built for them.
+func (pm *PolicyRule) NetworkResourceSourceID() (string, bool) {
+	if pm.SourceResource.ID == "" {
+		return "", false
+	}
+
+	switch pm.SourceResource.Type {
+	case ResourceTypeHost, ResourceTypeSubnet:
+		return pm.SourceResource.ID, true
+	default:
+		return "", false
+	}
+}
+
+// NetworkResourceSourceID returns the network resource the policy's first rule
+// uses as its traffic source. Policies carry a single rule today, matching the
+// rest of the resource-policy lookups.
+func (p *Policy) NetworkResourceSourceID() (string, bool) {
+	if len(p.Rules) == 0 || p.Rules[0] == nil {
+		return "", false
+	}
+	return p.Rules[0].NetworkResourceSourceID()
+}

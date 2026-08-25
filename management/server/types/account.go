@@ -1389,6 +1389,15 @@ func (a *Account) GetPoliciesForNetworkResource(resourceId string) []*Policy {
 				break
 			}
 
+			// A rule can also name the resource as its source, which is how an
+			// agentless host behind the routing peer is granted access to peers.
+			// The resource still needs its routers and routes distributed, so the
+			// policy counts as applied to it either way.
+			if sourceID, ok := rule.NetworkResourceSourceID(); ok && sourceID == resourceId {
+				resourceAppliedPolicies = append(resourceAppliedPolicies, policy)
+				break
+			}
+
 			for _, group := range networkResourceGroups {
 				if slices.Contains(rule.Destinations, group.ID) {
 					resourceAppliedPolicies = append(resourceAppliedPolicies, policy)

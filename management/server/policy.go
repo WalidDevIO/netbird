@@ -207,6 +207,10 @@ func validatePolicy(ctx context.Context, transaction store.Store, accountID stri
 			ruleCopy.PolicyID = policy.ID
 		}
 
+		if err := validateRuleResources(ctx, transaction, accountID, ruleCopy); err != nil {
+			return nil, err
+		}
+
 		ruleCopy.Sources = getValidGroupIDs(groups, ruleCopy.Sources)
 		ruleCopy.Destinations = getValidGroupIDs(groups, ruleCopy.Destinations)
 		policy.Rules[i] = ruleCopy
@@ -217,6 +221,63 @@ func validatePolicy(ctx context.Context, transaction store.Store, accountID stri
 	}
 
 	return existingPolicy, nil
+}
+
+// validateRuleResources checks the rule's source and destination resources
+// against the account. Unlike group ids, an unresolvable resource is rejected
+// rather than filtered out: a rule that silently loses its only source or
+// destination would be stored as a rule matching nothing.
+func validateRuleResources(ctx context.Context, transaction store.Store, accountID string, rule *types.PolicyRule) error {
+	sourceIsNetwork := rule.SourceResource.Type != "" && rule.SourceResource.Type != types.ResourceTypePeer
+	destIsNetwork := rule.DestinationResource.Type != "" && rule.DestinationResource.Type != types.ResourceTypePeer
+
+	if sourceIsNetwork && destIsNetwork {
+		return status.Errorf(status.InvalidArgument, "a rule cannot use a network resource as both source and destination")
+	}
+
+	if sourceIsNetwork {
+		if _, ok := rule.NetworkResourceSourceID(); !ok {
+			return status.Errorf(status.InvalidArgument,
+				"resource type %q cannot be a rule source: only host and subnet resources carry a prefix to match on",
+				rule.SourceResource.Type)
+		}
+		if len(rule.Destinations) == 0 && rule.DestinationResource.ID == "" {
+			return status.Errorf(status.InvalidArgument, "a rule with a network resource source needs at least one destination")
+		}
+	}
+
+	if err := validateRuleResource(ctx, transaction, accountID, rule.SourceResource); err != nil {
+		return err
+	}
+
+	return validateRuleResource(ctx, transaction, accountID, rule.DestinationResource)
+}
+
+// validateRuleResource confirms the referenced resource exists in the account
+// and matches the declared type.
+func validateRuleResource(ctx context.Context, transaction store.Store, accountID string, resource types.Resource) error {
+	if resource.ID == "" {
+		return nil
+	}
+
+	if resource.Type == types.ResourceTypePeer {
+		if _, err := transaction.GetPeerByID(ctx, store.LockingStrengthNone, accountID, resource.ID); err != nil {
+			return status.Errorf(status.InvalidArgument, "unknown peer resource: %s", resource.ID)
+		}
+		return nil
+	}
+
+	networkResource, err := transaction.GetNetworkResourceByID(ctx, store.LockingStrengthNone, accountID, resource.ID)
+	if err != nil {
+		return status.Errorf(status.InvalidArgument, "unknown network resource: %s", resource.ID)
+	}
+
+	if string(networkResource.Type) != string(resource.Type) {
+		return status.Errorf(status.InvalidArgument, "network resource %s is of type %q, not %q",
+			resource.ID, networkResource.Type, resource.Type)
+	}
+
+	return nil
 }
 
 // getValidPostureCheckIDs filters and returns only the valid posture check IDs from the provided list.

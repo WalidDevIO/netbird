@@ -541,9 +541,11 @@ func ruleSideResource(rule *types.PolicyRule, side policySide) types.Resource {
 // (resolved to members in expand) and its direct peer. When the side is the
 // DESTINATION and references a network resource (directly or via a destination
 // group's resources), it also folds the routers that serve that resource's network
-// — a destination resource is reached through its routers. A resource on the SOURCE
-// side routes to nobody (GetPoliciesForNetworkResource matches destinations only),
-// so the router hop is destination-only.
+// — a destination resource is reached through its routers.
+//
+// A network resource named directly on the SOURCE side is reached through its
+// routers too: the resource's own network is what initiates the traffic, so its
+// routers carry the forward rules and the peers' routes.
 func (r *resolver) foldPolicySide(policy *types.Policy, side policySide) {
 	if policy == nil {
 		return
@@ -555,9 +557,31 @@ func (r *resolver) foldPolicySide(policy *types.Policy, side policySide) {
 			r.affectedPeers[res.ID] = struct{}{}
 		}
 	}
+
 	if side == sideDestination {
 		r.foldRoutersForResources(r.policyDestinationResourceIDs(policy))
+		return
 	}
+	r.foldRoutersForResources(policySourceResourceIDs(policy))
+}
+
+// policySourceResourceIDs returns the network resources a policy names directly
+// as a rule source. Source groups are not walked for resources: a group only
+// carries a resource on the destination side, where it means "the resource is
+// the target".
+func policySourceResourceIDs(policies ...*types.Policy) map[string]struct{} {
+	resourceIDs := make(map[string]struct{})
+	for _, policy := range policies {
+		if policy == nil {
+			continue
+		}
+		for _, rule := range policy.Rules {
+			if id, ok := rule.NetworkResourceSourceID(); ok {
+				resourceIDs[id] = struct{}{}
+			}
+		}
+	}
+	return resourceIDs
 }
 
 // appendPoliciesForPostureChecks appends every policy that references a changed
@@ -722,7 +746,10 @@ func policyTargetsResourceOrGroups(policy *types.Policy, resourceID string, grou
 		if !rule.Enabled {
 			continue
 		}
-		if rule.DestinationResource.Type != types.ResourceTypePeer && rule.DestinationResource.ID == resourceID && resourceID != "" {
+		if resourceID != "" && rule.DestinationResource.Type != types.ResourceTypePeer && rule.DestinationResource.ID == resourceID {
+			return true
+		}
+		if id, ok := rule.NetworkResourceSourceID(); ok && id == resourceID && resourceID != "" {
 			return true
 		}
 		if anyInSet(rule.Destinations, groups) {
@@ -1108,13 +1135,24 @@ func (r *resolver) addGroupResourceIDs(groupIDs map[string]struct{}, resourceIDs
 	}
 }
 
-// collectPolicySources folds the source groups/peers of a snapshot policy's enabled
-// rules (a disabled rule grants no access).
+// collectPolicySources folds the groups/peers sitting opposite the resource in a
+// snapshot policy's enabled rules (a disabled rule grants no access). That is the
+// source side normally, and the destination side when the resource is itself the
+// rule's source.
 func collectPolicySources(policy *types.Policy, groups, peers map[string]struct{}) {
 	for _, rule := range policy.Rules {
 		if !rule.Enabled {
 			continue
 		}
+
+		if _, ok := rule.NetworkResourceSourceID(); ok {
+			addAll(groups, rule.Destinations)
+			if rule.DestinationResource.Type == types.ResourceTypePeer && rule.DestinationResource.ID != "" {
+				peers[rule.DestinationResource.ID] = struct{}{}
+			}
+			continue
+		}
+
 		addAll(groups, rule.Sources)
 		if rule.SourceResource.Type == types.ResourceTypePeer && rule.SourceResource.ID != "" {
 			peers[rule.SourceResource.ID] = struct{}{}
