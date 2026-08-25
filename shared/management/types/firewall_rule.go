@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -25,6 +26,13 @@ type FirewallRule struct {
 
 	// PeerIP of the peer
 	PeerIP string
+
+	// SourcePrefix is the traffic source expressed as a network prefix rather
+	// than a single overlay address. It is set for rules whose policy source is
+	// a network resource, so the receiving peer can admit traffic from
+	// agentless hosts behind a routing peer. Peer-sourced rules leave it zero
+	// and keep using PeerIP.
+	SourcePrefix netip.Prefix
 
 	// Direction of the traffic
 	Direction int

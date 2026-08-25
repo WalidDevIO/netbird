@@ -58,10 +58,19 @@ func ToProtocolRoute(route *nmdata.Route) *proto.Route {
 // populated alongside the deprecated PeerIP for forward compatibility.
 // Wildcard rules ("0.0.0.0") are expanded into separate v4/v6 SourcePrefixes
 // when includeIPv6 is true.
+//
+// Rules carrying a SourcePrefix are dropped for peers that cannot read
+// SourcePrefixes: PeerIP can only express a single address, so shipping one
+// would install a rule matching the prefix's network address instead of the
+// network the policy grants.
 func ToProtocolFirewallRules(rules []*types.FirewallRule, includeIPv6, useSourcePrefixes bool) []*proto.FirewallRule {
 	result := make([]*proto.FirewallRule, 0, len(rules))
 	for i := range rules {
 		rule := rules[i]
+
+		if rule.SourcePrefix.IsValid() && !useSourcePrefixes {
+			continue
+		}
 
 		fwRule := &proto.FirewallRule{
 			PolicyID:  []byte(rule.PolicyID),
@@ -72,7 +81,16 @@ func ToProtocolFirewallRules(rules []*types.FirewallRule, includeIPv6, useSource
 			Port:      rule.Port,
 		}
 
-		if useSourcePrefixes && rule.PeerIP != "" {
+		switch {
+		case !useSourcePrefixes:
+		case rule.SourcePrefix.IsValid():
+			encoded, err := netiputil.EncodePrefix(rule.SourcePrefix)
+			if err != nil {
+				log.Errorf("encode source prefix %s for policy %s: %v", rule.SourcePrefix, rule.PolicyID, err)
+				continue
+			}
+			fwRule.SourcePrefixes = [][]byte{encoded}
+		case rule.PeerIP != "":
 			result = append(result, populateSourcePrefixes(fwRule, rule, includeIPv6)...)
 		}
 
