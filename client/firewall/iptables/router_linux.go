@@ -83,10 +83,14 @@ type routeRules map[string][]string
 type ipsetCounter = refcounter.Counter[string, []netip.Prefix, struct{}]
 
 type router struct {
-	iptablesClient   *iptables.IPTables
-	rules            routeRules
-	ipsetCounter     *ipsetCounter
-	wgIface          iFaceMapper
+	iptablesClient *iptables.IPTables
+	rules          routeRules
+	ipsetCounter   *ipsetCounter
+	wgIface        iFaceMapper
+	// ruleChains records the chain each route rule was written to, so deletion
+	// targets the same one. Ingress rules do not live in the same chain as the
+	// rest.
+	ruleChains       map[string]string
 	legacyManagement bool
 	mtu              uint16
 	v6               bool
@@ -100,6 +104,7 @@ func newRouter(iptablesClient *iptables.IPTables, wgIface iFaceMapper, mtu uint1
 		iptablesClient: iptablesClient,
 		rules:          make(map[string][]string),
 		wgIface:        wgIface,
+		ruleChains:     make(map[string]string),
 		mtu:            mtu,
 		v6:             iptablesClient.Proto() == iptables.ProtocolIPv6,
 		ipFwdState:     ipfwdstate.NewIPForwardingState(wgIface.Name()),
@@ -172,12 +177,25 @@ func (r *router) AddRouteFiltering(
 		return nil, fmt.Errorf("generate route rule spec: %w", err)
 	}
 
-	// Insert DROP rules at the beginning, append ACCEPT rules at the end
-	if action == firewall.ActionDrop {
+	chain := r.routeChainFor(destination)
+
+	// The two chains order their rules the opposite way round, and both are
+	// deliberate.
+	//
+	// Traffic leaving the overlay is filtered in RT-FWD-IN, where a drop has
+	// always taken precedence over an allow. Traffic entering it is filtered in
+	// RT-FWD-OUT, where the allows name the peers a resource may reach and a
+	// single drop closes off the rest of its prefix; there the allows have to be
+	// evaluated first, or the drop would shadow them.
+	//
+	// Positioning each kind explicitly, rather than relying on the order rules
+	// happen to arrive in, keeps an incremental update from interleaving them
+	// wrongly.
+	if (action == firewall.ActionDrop) == (chain == chainRTFWDIN) {
 		// after the established rule
-		err = r.iptablesClient.Insert(tableFilter, chainRTFWDIN, 2, rule...)
+		err = r.iptablesClient.Insert(tableFilter, chain, 2, rule...)
 	} else {
-		err = r.iptablesClient.Append(tableFilter, chainRTFWDIN, rule...)
+		err = r.iptablesClient.Append(tableFilter, chain, rule...)
 	}
 
 	if err != nil {
@@ -185,10 +203,38 @@ func (r *router) AddRouteFiltering(
 	}
 
 	r.rules[string(ruleKey)] = rule
+	r.ruleChains[string(ruleKey)] = chain
 
 	r.updateState()
 
 	return ruleKey, nil
+}
+
+// routeChainFor picks the chain a route rule belongs in from where its traffic
+// is headed. A destination inside the overlay means traffic entering it from a
+// routed network, which the FORWARD hook sends through RT-FWD-OUT; anything else
+// is traffic leaving the overlay and goes through RT-FWD-IN.
+func (r *router) routeChainFor(destination firewall.Network) string {
+	if !destination.IsPrefix() {
+		return chainRTFWDIN
+	}
+
+	overlay := r.wgIface.Address().Network
+	if !overlay.IsValid() {
+		return chainRTFWDIN
+	}
+
+	dst := destination.Prefix.Masked()
+	if dst.Addr().Is4() != overlay.Addr().Is4() {
+		return chainRTFWDIN
+	}
+
+	// A destination that merely overlaps the overlay is not the same thing as
+	// one contained in it: only the latter is traffic aimed at peers.
+	if dst.Bits() >= overlay.Bits() && overlay.Contains(dst.Addr()) {
+		return chainRTFWDOUT
+	}
+	return chainRTFWDIN
 }
 
 func (r *router) hasRule(id string) bool {
@@ -200,10 +246,15 @@ func (r *router) DeleteRouteRule(rule firewall.Rule) error {
 	ruleKey := rule.ID()
 
 	if rule, exists := r.rules[ruleKey]; exists {
-		if err := r.iptablesClient.Delete(tableFilter, chainRTFWDIN, rule...); err != nil {
+		chain := r.ruleChains[ruleKey]
+		if chain == "" {
+			chain = chainRTFWDIN
+		}
+		if err := r.iptablesClient.Delete(tableFilter, chain, rule...); err != nil {
 			return fmt.Errorf("delete route rule: %v", err)
 		}
 		delete(r.rules, ruleKey)
+		delete(r.ruleChains, ruleKey)
 
 		if err := r.decrementSetCounter(rule); err != nil {
 			return fmt.Errorf("decrement ipset counter: %w", err)

@@ -35,11 +35,15 @@ const (
 
 	chainNameNatPrerouting = "PREROUTING"
 	chainNameRoutingFw     = "netbird-rt-fwd"
-	chainNameRoutingNat    = "netbird-rt-postrouting"
-	chainNameRoutingRdr    = "netbird-rt-redirect"
-	chainNameNATOutput     = "netbird-nat-output"
-	chainNameForward       = "FORWARD"
-	chainNameMangleForward = "netbird-mangle-forward"
+	// chainNameRoutingFwIngress filters traffic entering the overlay from a
+	// routed network. netbird-rt-fwd only ever sees the opposite direction: the
+	// ACL manager jumps to it on iifname, so nothing reaches it on the way in.
+	chainNameRoutingFwIngress = "netbird-rt-fwd-ingress"
+	chainNameRoutingNat       = "netbird-rt-postrouting"
+	chainNameRoutingRdr       = "netbird-rt-redirect"
+	chainNameNATOutput        = "netbird-nat-output"
+	chainNameForward          = "FORWARD"
+	chainNameMangleForward    = "netbird-mangle-forward"
 
 	firewalldTableName = "firewalld"
 
@@ -234,6 +238,11 @@ func (r *router) createContainers() error {
 		Table: r.workTable,
 	})
 
+	r.chains[chainNameRoutingFwIngress] = r.conn.AddChain(&nftables.Chain{
+		Name:  chainNameRoutingFwIngress,
+		Table: r.workTable,
+	})
+
 	prio := *nftables.ChainPriorityNATSource - 1
 	r.chains[chainNameRoutingNat] = r.conn.AddChain(&nftables.Chain{
 		Name:     chainNameRoutingNat,
@@ -276,6 +285,7 @@ func (r *router) createContainers() error {
 	})
 
 	insertReturnTrafficRule(r.conn, r.workTable, r.chains[chainNameRoutingFw])
+	insertReturnTrafficRule(r.conn, r.workTable, r.chains[chainNameRoutingFwIngress])
 
 	r.addPostroutingRules()
 
@@ -394,7 +404,7 @@ func (r *router) AddRouteFiltering(
 		return ruleKey, nil
 	}
 
-	chain := r.chains[chainNameRoutingFw]
+	chain := r.routeChainFor(destination)
 	var exprs []expr.Any
 
 	var source firewall.Network
@@ -456,7 +466,12 @@ func (r *router) AddRouteFiltering(
 	}
 
 	// Insert DROP rules at the beginning, append ACCEPT rules at the end
-	if action == firewall.ActionDrop {
+	// The two chains order their rules the opposite way round, and both are
+	// deliberate. Leaving the overlay, a drop has always taken precedence over
+	// an allow. Entering it, the allows name the peers a resource may reach and
+	// a single drop closes off the rest of its prefix, so the allows have to be
+	// evaluated first or the drop would shadow them.
+	if (action == firewall.ActionDrop) == (chain != r.chains[chainNameRoutingFwIngress]) {
 		// TODO: Insert after the established rule
 		rule = r.conn.InsertRule(rule)
 	} else {
@@ -2265,4 +2280,30 @@ func (r *router) getIpSetExprs(ref refcounter.Ref[*nftables.Set], isSource bool)
 			SetID:          ref.Out.ID,
 		},
 	}, nil
+}
+
+// routeChainFor picks the chain a route rule belongs in from where its traffic
+// is headed. A destination inside the overlay is traffic entering it from a
+// routed network; anything else is traffic leaving it.
+func (r *router) routeChainFor(destination firewall.Network) *nftables.Chain {
+	if !destination.IsPrefix() {
+		return r.chains[chainNameRoutingFw]
+	}
+
+	overlay := r.wgIface.Address().Network
+	if !overlay.IsValid() {
+		return r.chains[chainNameRoutingFw]
+	}
+
+	dst := destination.Prefix.Masked()
+	if dst.Addr().Is4() != overlay.Addr().Is4() {
+		return r.chains[chainNameRoutingFw]
+	}
+
+	// Overlapping the overlay is not the same as being contained in it: only
+	// the latter is traffic aimed at peers.
+	if dst.Bits() >= overlay.Bits() && overlay.Contains(dst.Addr()) {
+		return r.chains[chainNameRoutingFwIngress]
+	}
+	return r.chains[chainNameRoutingFw]
 }

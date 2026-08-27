@@ -466,10 +466,66 @@ func (c *NetworkMapComponents) generateResourceSourceRules(
 		return
 	}
 
-	generate(rule, resource.Prefix, FirewallRuleDirectionIN)
+	preservesSource, masqueradeAddrs := c.resourceRouterSources(resource.NetworkID)
+
+	directions := []int{FirewallRuleDirectionIN}
 	if rule.Bidirectional {
-		generate(rule, resource.Prefix, FirewallRuleDirectionOUT)
+		directions = append(directions, FirewallRuleDirectionOUT)
 	}
+
+	for _, direction := range directions {
+		// A router that leaves the source address alone delivers packets still
+		// carrying the originating host's address, so the peer matches the
+		// resource's prefix.
+		if preservesSource {
+			generate(rule, resource.Prefix, direction)
+		}
+
+		// A masquerading router rewrites the source to its own overlay address
+		// before the packet enters the tunnel, so that is what reaches the peer
+		// and the prefix would never match. Admit the router instead; the
+		// granularity is kept on the router itself, which only forwards the
+		// prefix this policy grants.
+		for _, addr := range masqueradeAddrs {
+			generate(rule, netip.PrefixFrom(addr, addr.BitLen()), direction)
+		}
+	}
+}
+
+// resourceRouterSources reports how a resource's routers present traffic to the
+// destination peers: whether any of them preserves the originating address, and
+// the overlay addresses of those that masquerade it away.
+//
+// A network can mix the two, so both answers are returned rather than one
+// exclusive choice.
+func (c *NetworkMapComponents) resourceRouterSources(networkID string) (preservesSource bool, masqueradeAddrs []netip.Addr) {
+	for peerID, router := range c.RoutersMap[networkID] {
+		if router == nil || !router.Enabled {
+			continue
+		}
+
+		if !router.Masquerade {
+			preservesSource = true
+			continue
+		}
+
+		peer := c.GetPeerInfo(peerID)
+		if peer == nil {
+			peer = c.GetRouterPeerInfo(peerID)
+		}
+		if peer == nil {
+			continue
+		}
+
+		if peer.IP.IsValid() {
+			masqueradeAddrs = append(masqueradeAddrs, peer.IP)
+		}
+		if peer.IPv6.IsValid() {
+			masqueradeAddrs = append(masqueradeAddrs, peer.IPv6)
+		}
+	}
+
+	return preservesSource, masqueradeAddrs
 }
 
 // getNetworkResourceByID looks up a network resource shipped with these
@@ -1112,9 +1168,120 @@ func (c *NetworkMapComponents) getPeerNetworkResourceFirewallRules(ctx context.C
 				routesFirewallRules = append(routesFirewallRules, rule)
 			}
 		}
+
+		routesFirewallRules = append(routesFirewallRules,
+			c.getResourceIngressRules(peerID, resourceID, resourcePolicies)...)
 	}
 
 	return routesFirewallRules
+}
+
+// getResourceIngressRules builds what a masquerading routing peer needs for
+// traffic entering the overlay from one of its resources.
+//
+// Masquerading rewrites the source address here, before the packet reaches the
+// destination peer, so that peer can no longer tell one subnet behind this
+// router from another and admits the router as a whole. The granular decision
+// therefore has to be taken here, while the originating address is still
+// visible: allow the granted prefix toward the peers the policy names, and drop
+// the rest of that prefix headed into the overlay.
+//
+// A router that preserves the source address needs none of this: the
+// destination peer still matches the prefix itself.
+func (c *NetworkMapComponents) getResourceIngressRules(peerID, resourceID string, policies []*nmdata.Policy) []*RouteFirewallRule {
+	router := c.RoutersMap[c.resourceNetworkID(resourceID)][peerID]
+	if router == nil || !router.Enabled || !router.Masquerade {
+		return nil
+	}
+
+	resource := c.getNetworkResourceByID(resourceID)
+	if resource == nil || !resource.Enabled || !resource.Prefix.IsValid() {
+		return nil
+	}
+
+	overlay := c.overlayPrefix()
+	if overlay == "" {
+		return nil
+	}
+
+	sources := []string{resource.Prefix.String()}
+	var rules []*RouteFirewallRule
+	granted := false
+
+	for _, policy := range policies {
+		if !policy.Enabled {
+			continue
+		}
+		for _, rule := range policy.Rules {
+			if !rule.Enabled {
+				continue
+			}
+			sourceID, ok := NetworkResourceSourceID(rule)
+			if !ok || sourceID != resourceID {
+				continue
+			}
+
+			for _, destPeerID := range c.getRuleDestinationPeerIDs(rule) {
+				peer := c.GetPeerInfo(destPeerID)
+				if peer == nil || !peer.IP.IsValid() {
+					continue
+				}
+				granted = true
+				rules = append(rules, &RouteFirewallRule{
+					PolicyID:     rule.ID,
+					SourceRanges: sources,
+					Action:       string(PolicyTrafficActionAccept),
+					Destination:  netip.PrefixFrom(peer.IP, peer.IP.BitLen()).String(),
+					Protocol:     routeRuleProtocol(rule.Protocol),
+				})
+			}
+		}
+	}
+
+	if !granted {
+		return nil
+	}
+
+	// Closes the prefix off from everything else in the overlay. Without it the
+	// allow rules above are decorative: the destination peers already trust this
+	// router, so any other subnet it forwards would reach them too.
+	rules = append(rules, &RouteFirewallRule{
+		SourceRanges: sources,
+		Action:       string(PolicyTrafficActionDrop),
+		Destination:  overlay,
+		Protocol:     string(PolicyRuleProtocolALL),
+	})
+
+	return rules
+}
+
+// routeRuleProtocol maps the policy protocol onto what a route rule can carry.
+// The SSH pseudo-protocol is TCP on the wire.
+func routeRuleProtocol(p string) string {
+	if p == string(PolicyRuleProtocolNetbirdSSH) {
+		return string(PolicyRuleProtocolTCP)
+	}
+	return p
+}
+
+// resourceNetworkID returns the network a resource belongs to.
+func (c *NetworkMapComponents) resourceNetworkID(resourceID string) string {
+	if resource := c.getNetworkResourceByID(resourceID); resource != nil {
+		return resource.NetworkID
+	}
+	return ""
+}
+
+// overlayPrefix returns the account's overlay network in CIDR form.
+func (c *NetworkMapComponents) overlayPrefix() string {
+	if c.Network == nil {
+		return ""
+	}
+	prefix, err := netip.ParsePrefix(c.Network.Net.String())
+	if err != nil {
+		return ""
+	}
+	return prefix.Masked().String()
 }
 
 func (c *NetworkMapComponents) getPoliciesSourcePeers(policies []*nmdata.Policy) map[string]struct{} {

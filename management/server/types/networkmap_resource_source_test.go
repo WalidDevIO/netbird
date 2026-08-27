@@ -352,3 +352,91 @@ func TestResourceSource_PolicyIsAppliedToResource(t *testing.T) {
 	require.Len(t, policies, 1, "a policy naming the resource as its source applies to it")
 	assert.Equal(t, "policy-lan-initiates", policies[0].ID)
 }
+
+// setMasquerade flips masquerading on the account's single network router.
+func setMasquerade(account *types.Account, on bool) {
+	account.NetworkRouters[0].Masquerade = on
+}
+
+// TestResourceSource_MasqueradeAdmitsTheRouterInstead is the crux of the
+// masquerading case: the routing peer rewrites the source before the packet
+// reaches the peer, so a rule on the resource's prefix would match nothing. The
+// peer is told to admit the router instead.
+func TestResourceSource_MasqueradeAdmitsTheRouterInstead(t *testing.T) {
+	account := resourceSourceAccount(false)
+	setMasquerade(account, true)
+
+	nm := networkMapFromComponents(t, account, "peer-target", allPeersValidated(account))
+
+	assert.Empty(t, prefixRules(nm.FirewallRules, lanPrefix),
+		"the prefix would never match once the source is rewritten")
+
+	routerRules := prefixRules(nm.FirewallRules, "100.64.0.10/32")
+	require.Len(t, routerRules, 1, "the peer should admit the routing peer, got %+v", nm.FirewallRules)
+	assert.Equal(t, types.FirewallRuleDirectionIN, routerRules[0].Direction)
+}
+
+// TestResourceSource_MixedRoutersEmitBoth covers a network whose routers
+// disagree: traffic can arrive either rewritten or not, so both shapes are
+// needed for the grant to hold on every path.
+func TestResourceSource_MixedRoutersEmitBoth(t *testing.T) {
+	account := resourceSourceAccount(false)
+	setMasquerade(account, true)
+	account.NetworkRouters = append(account.NetworkRouters, &routerTypes.NetworkRouter{
+		ID: "router-2", NetworkID: "net-1", Peer: "peer-bystander", Enabled: true,
+		AccountID: account.Id, Masquerade: false, Metric: 9999,
+	})
+
+	nm := networkMapFromComponents(t, account, "peer-target", allPeersValidated(account))
+
+	assert.Len(t, prefixRules(nm.FirewallRules, lanPrefix), 1,
+		"the non-masquerading router still delivers the original address")
+	assert.Len(t, prefixRules(nm.FirewallRules, "100.64.0.10/32"), 1,
+		"the masquerading one delivers its own")
+}
+
+// TestResourceSource_MasqueradingRouterFiltersOnItself checks the other half:
+// once the peer trusts the router wholesale, the router has to be the one
+// keeping the grant narrow.
+func TestResourceSource_MasqueradingRouterFiltersOnItself(t *testing.T) {
+	account := resourceSourceAccount(false)
+	setMasquerade(account, true)
+
+	nm := networkMapFromComponents(t, account, "peer-router", allPeersValidated(account))
+
+	var allow, deny *types.RouteFirewallRule
+	for _, r := range nm.RoutesFirewallRules {
+		if len(r.SourceRanges) != 1 || r.SourceRanges[0] != lanPrefix {
+			continue
+		}
+		switch r.Action {
+		case string(types.PolicyTrafficActionAccept):
+			allow = r
+		case string(types.PolicyTrafficActionDrop):
+			deny = r
+		}
+	}
+
+	require.NotNil(t, allow, "expected an allow toward the destination peer, got %+v", nm.RoutesFirewallRules)
+	assert.Equal(t, targetPeerIP+"/32", allow.Destination)
+
+	require.NotNil(t, deny, "expected the rest of the prefix to be closed off")
+	assert.Equal(t, "100.64.0.0/16", deny.Destination,
+		"the deny should cover the overlay, not just one peer")
+}
+
+// TestResourceSource_NoMasqueradeLeavesRouterUnchanged is the regression guard:
+// a router that preserves the source needs no filtering of its own, and adding
+// any would change a path that is currently unfiltered.
+func TestResourceSource_NoMasqueradeLeavesRouterUnchanged(t *testing.T) {
+	account := resourceSourceAccount(false)
+	setMasquerade(account, false)
+
+	nm := networkMapFromComponents(t, account, "peer-router", allPeersValidated(account))
+
+	for _, r := range nm.RoutesFirewallRules {
+		if len(r.SourceRanges) == 1 && r.SourceRanges[0] == lanPrefix {
+			t.Fatalf("no ingress rule expected without masquerading, got %+v", r)
+		}
+	}
+}

@@ -483,7 +483,8 @@ func (m *AclManager) createDefaultChains() (err error) {
 
 	// netbird-acl-forward-filter
 	chainFwFilter := m.createFilterChainWithHook(chainNameForwardFilter, nftables.ChainHookForward)
-	m.addJumpRulesToRtForward(chainFwFilter) // to netbird-rt-fwd
+	m.addJumpRulesToRtForward(chainFwFilter)       // to netbird-rt-fwd
+	m.addJumpRuleToRtForwardIngress(chainFwFilter) // to netbird-rt-fwd-ingress
 	m.addDropExpressions(chainFwFilter, expr.MetaKeyIIFNAME)
 
 	err = m.rConn.Flush()
@@ -561,6 +562,29 @@ func (m *AclManager) addJumpRulesToRtForward(chainFwFilter *nftables.Chain) {
 		Table: m.workTable,
 		Chain: chainFwFilter,
 		Exprs: expressions,
+	})
+}
+
+// addJumpRuleToRtForwardIngress sends forwarded traffic headed for the overlay
+// through the ingress chain. The jump above matches on the inbound interface and
+// so only ever sees traffic leaving the overlay; a routed network reaching the
+// mesh arrives on the other side and would otherwise pass unfiltered.
+func (m *AclManager) addJumpRuleToRtForwardIngress(chainFwFilter *nftables.Chain) {
+	_ = m.rConn.AddRule(&nftables.Rule{
+		Table: chainFwFilter.Table,
+		Chain: chainFwFilter,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     ifname(m.wgIface.Name()),
+			},
+			&expr.Verdict{
+				Kind:  expr.VerdictJump,
+				Chain: chainNameRoutingFwIngress,
+			},
+		},
 	})
 }
 

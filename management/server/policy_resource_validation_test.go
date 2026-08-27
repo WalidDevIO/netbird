@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	resourceTypes "github.com/netbirdio/netbird/management/server/networks/resources/types"
+	routerTypes "github.com/netbirdio/netbird/management/server/networks/routers/types"
 	networkTypes "github.com/netbirdio/netbird/management/server/networks/types"
 	"github.com/netbirdio/netbird/management/server/types"
 )
@@ -19,6 +20,13 @@ import (
 // the test needs them persisted rather than only present in memory.
 func seedNetworkResource(t *testing.T, am *DefaultAccountManager, accountID string, resType resourceTypes.NetworkResourceType, prefix string) string {
 	t.Helper()
+	return seedNetworkResourceWithRouter(t, am, accountID, resType, prefix, false)
+}
+
+// seedNetworkResourceWithRouter stores a network, one resource on it, and a
+// router whose masquerade setting the caller chooses.
+func seedNetworkResourceWithRouter(t *testing.T, am *DefaultAccountManager, accountID string, resType resourceTypes.NetworkResourceType, prefix string, masquerade bool) string {
+	t.Helper()
 
 	ctx := context.Background()
 	network := &networkTypes.Network{
@@ -27,6 +35,17 @@ func seedNetworkResource(t *testing.T, am *DefaultAccountManager, accountID stri
 		Name:      "Branch LAN",
 	}
 	require.NoError(t, am.Store.SaveNetwork(ctx, network))
+
+	if masquerade {
+		require.NoError(t, am.Store.CreateNetworkRouter(ctx, &routerTypes.NetworkRouter{
+			ID:         xid.New().String(),
+			NetworkID:  network.ID,
+			AccountID:  accountID,
+			Peer:       "some-peer",
+			Enabled:    true,
+			Masquerade: true,
+		}))
+	}
 
 	resource := &resourceTypes.NetworkResource{
 		ID:        xid.New().String(),
@@ -251,4 +270,35 @@ func TestSavePolicy_ExistingShapesStillAccepted(t *testing.T) {
 		}, true)
 		require.NoError(t, err)
 	})
+}
+
+// TestSavePolicy_AcceptsSourceResourceUnderMasquerade: masquerading no longer
+// rules the shape out. The destination peer is told to admit the routing peer
+// instead of the prefix, and the routing peer only forwards the granted prefix,
+// so the grant still means what it says.
+func TestSavePolicy_AcceptsSourceResourceUnderMasquerade(t *testing.T) {
+	manager, _, account, _, _, _ := setupNetworkMapTest(t)
+	ctx := context.Background()
+
+	require.NoError(t, manager.CreateGroup(ctx, account.Id, userID, &types.Group{ID: "groupTargets", Name: "Targets"}))
+	resourceID := seedNetworkResourceWithRouter(t, manager, account.Id, resourceTypes.Subnet, "10.20.0.0/24", true)
+
+	_, err := manager.SavePolicy(ctx, account.Id, userID,
+		resourceSourcePolicy(account.Id, resourceID, types.ResourceTypeSubnet, []string{"groupTargets"}), true)
+
+	require.NoError(t, err)
+}
+
+// TestSavePolicy_AcceptsSourceResourceWithoutMasquerade is the counterpart.
+func TestSavePolicy_AcceptsSourceResourceWithoutMasquerade(t *testing.T) {
+	manager, _, account, _, _, _ := setupNetworkMapTest(t)
+	ctx := context.Background()
+
+	require.NoError(t, manager.CreateGroup(ctx, account.Id, userID, &types.Group{ID: "groupTargets", Name: "Targets"}))
+	resourceID := seedNetworkResourceWithRouter(t, manager, account.Id, resourceTypes.Subnet, "10.20.0.0/24", false)
+
+	_, err := manager.SavePolicy(ctx, account.Id, userID,
+		resourceSourcePolicy(account.Id, resourceID, types.ResourceTypeSubnet, []string{"groupTargets"}), true)
+
+	require.NoError(t, err)
 }
